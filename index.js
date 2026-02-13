@@ -1,226 +1,360 @@
-import express from 'express';
-import { emaLatest, rsiLatest, macdLatest, trendLatest, computeSignal } from './indicators.js';
-import WebSocket from 'ws';
+import 'dotenv/config'
+import express from 'express'
+import { Sequelize } from 'sequelize'
+import WebSocket from 'ws'
+import { RSI, MACD } from 'technicalindicators'
+import BTCIndicator from './models/BTCIndicator.js'
 
-// Delta India multi-timeframe backend (console-only)
-const SYMBOL = 'BTCUSD';
-const TIMEFRAMES = ['1m'];
-const CANDLES_REQUIRED = 500;
-const PORT = process.env.PORT || 4000;
-
-const resolutionSeconds = {
-  '1m': 60
-};
-
-function formatNum(n) {
-  return (n === null || n === undefined) ? 'n/a' : Number(n).toFixed(2);
-}
-
-function normalizeTimestamp(ts) {
-  if (!ts) return 0;
-  // if ts looks like seconds (reasonable < 1e12), convert to ms
-  if (ts < 1e12) return ts * 1000;
-  return ts;
-}
-
-// in-memory store per timeframe
-const candlesStore = {};
-
-async function fetchDeltaHistory(symbol = SYMBOL, resolution = '1m', limit = CANDLES_REQUIRED) {
-  const now = Math.floor(Date.now() / 1000);
-  const resSec = resolutionSeconds[resolution];
-  if (!resSec) throw new Error(`Unsupported resolution: ${resolution}`);
-  const start = now - limit * resSec;
-  const end = now;
-  const url = `https://api.india.delta.exchange/v2/history/candles?symbol=${symbol}&resolution=${resolution}&start=${start}&end=${end}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Delta history fetch failed: ${res.status}`);
-  const data = await res.json();
-  // Normalize response shapes: Delta may return an object wrapper.
-  let arr = [];
-  if (Array.isArray(data)) arr = data;
-  else if (Array.isArray(data.result)) arr = data.result;
-  else if (Array.isArray(data.candles)) arr = data.candles;
-  else if (Array.isArray(data.data)) arr = data.data;
-  else if (Array.isArray(data.result?.candles)) arr = data.result.candles;
-  else {
-    arr = data.result || data.candles || data.data || [];
-  }
-  arr.reverse();
-  const candles = (arr || []).map(item => ({
-    time: normalizeTimestamp(item.time || item.start || item.t || 0),
-    open: Number(item.open),
-    high: Number(item.high),
-    low: Number(item.low),
-    close: Number(item.close),
-    volume: Number(item.volume || item.v || 0)
-  }));
-  return candles;
-}
-function normalizeDeltaTimestamp(ts) {
-  if (!ts) return 0;
-  // Delta sends microseconds
-  if (ts > 1e15) return Math.floor(ts / 1000);
-  // milliseconds
-  if (ts > 1e12) return ts;
-  // seconds
-  return ts * 1000;
-}
-
-function formatTime(ts) {
-  return new Date(ts).toLocaleString();
-}
-
-// Prevent logging the same candle more than once per timeframe
-const lastLoggedCandleTime = {};
-function logIndicatorsFor(resolution) {
-  const candles = candlesStore[resolution];
-  if (!candles || candles.length < 2) return;
-
-  const last = candles[candles.length - 1];
-
-  // Do NOT log the same candle twice
-  if (lastLoggedCandleTime[resolution] === last.time) {
-    return;
-  }
-  lastLoggedCandleTime[resolution] = last.time;
-
-  console.log(`${SYMBOL} | ${resolution}`);
-  console.log(`Candle Time: ${formatTime(last.time)}`);
-  console.log(
-    `Open: ${formatNum(last.open)}  High: ${formatNum(last.high)}  Low: ${formatNum(last.low)}`
-  );
-  console.log(`Close: ${formatNum(last.close)}`);
-
-  const ema9 = emaLatest(candles, 9);
-  const ema21 = emaLatest(candles, 21);
-  const rsi14 = rsiLatest(candles, 14);
-  const macd = macdLatest(candles);
-  const trend = trendLatest(candles);
-  const sig = computeSignal(candles);
-
-  console.log(`Trend: ${trend}`);
-  console.log(
-    `Signal: ${sig.signal}  (score:${sig.score})  reasons: ${sig.reasons.join(', ')}`
-  );
-  console.log(
-    `EMA(9): ${formatNum(ema9)}  EMA(21): ${formatNum(ema21)}`
-  );
-  console.log(`RSI(14): ${formatNum(rsi14)}`);
-
-  if (macd) {
-    console.log(
-      `MACD: ${formatNum(macd.macd)}  Signal: ${formatNum(macd.signal)}  Hist: ${formatNum(macd.hist)}`
-    );
-  }
-
-  console.log('-----------------------');
-}
-
-function connectDeltaWebSocket() {
-  const wss = 'wss://socket.india.delta.exchange';
-  const ws = new WebSocket(wss);
-
-  ws.on('open', () => {
-    const msg = {
-      type: 'subscribe',
-      payload: {
-        channels: [
-          { name: 'candlestick_1m', symbols: [SYMBOL] }
-        ]
-      }
-    };
-
-    ws.send(JSON.stringify(msg));
-    console.log('Connected to Delta India WS, subscribed to candlestick_1m');
-  });
-
-  ws.on('message', (raw) => {
-    try {
-      const data = JSON.parse(raw.toString());
-
-      // ---- Delta candlestick validation ----
-      if (
-        data.type !== 'candlestick_1m' ||
-        !data.candle_start_time ||
-        data.open === undefined ||
-        data.close === undefined
-      ) {
-        return;
-      }
-
-      const tf = data.resolution; // "1m"
-      if (!TIMEFRAMES.includes(tf)) return;
-
-      const candleTime = normalizeDeltaTimestamp(data.candle_start_time);
-
-      const candle = {
-        time: candleTime,
-        open: Number(data.open),
-        high: Number(data.high),
-        low: Number(data.low),
-        close: Number(data.close),
-        volume: Number(data.volume || 0)
-      };
-
-      const store = candlesStore[tf] || [];
-      const last = store[store.length - 1];
-
-      if (!last) {
-        store.push(candle);
-        candlesStore[tf] = store;
-        return;
-      }
-
-      if (candle.time === last.time) {
-        store[store.length - 1] = candle;
-        candlesStore[tf] = store;
-        return;
-      }
-
-      logIndicatorsFor(tf); 
-
-      // push new forming candle
-      store.push(candle);
-      if (store.length > CANDLES_REQUIRED) store.shift();
-      candlesStore[tf] = store;
-
-    } catch (err) {
-      console.error('Delta WS parse error:', err);
+const sequelize = new Sequelize(
+    process.env.DATABASE_NAME,
+    process.env.DATABASE_USER,
+    process.env.DATABASE_PASSWORD,
+    {
+        host: process.env.DATABASE_HOST,
+        port: process.env.DATABASE_PORT,
+        dialect: 'postgres',
+        logging: false
     }
-  });
+)
 
-  ws.on('close', () => {
-    console.log('Delta India WS closed — reconnecting in 5s');
-    setTimeout(connectDeltaWebSocket, 5000);
-  });
+BTCIndicator.init(sequelize)
 
-  ws.on('error', (err) => {
-    console.error('Delta India WS error', err.message || err);
-    ws.terminate();
-  });
+await sequelize.sync()
+console.log('Database connected')
+
+//    MEMORY STORE
+
+const store = {
+    '1m': [],
+    '15m': [],
+    '30m': []
 }
 
-async function main() {
-  // Fetch historical candles for each timeframe
-  for (const tf of TIMEFRAMES) {
-    const hist = await fetchDeltaHistory(SYMBOL, tf, CANDLES_REQUIRED);
-    candlesStore[tf] = hist;
-    console.log(`Fetched ${hist.length} historical candles for ${tf} from Delta India.`);
-  }
-  for (const tf of TIMEFRAMES) logIndicatorsFor(tf);
-  connectDeltaWebSocket();
+const SYMBOL = 'BTCUSD'
+const MAX_MEMORY = 500
 
-  const app = express();
-  app.get('/', (req, res) => res.send('Delta India history + websocket indicators running (console-only).'));
-  app.listen(PORT, () => {
-    console.log(`index running (console-only) on port ${PORT}`);
-  });
+function logCandle(tf, candle, indicators) {
+    console.log(`\n${SYMBOL} | ${tf}`)
+    console.log(`Time: ${new Date(candle.timestamp).toLocaleString()}`)
+    console.log(`O:${candle.open} H:${candle.high} L:${candle.low} C:${candle.close}`)
+    if (indicators) {
+        console.log(`RSI: ${indicators.rsi?.toFixed(2)}`)
+        if (indicators.macd) {
+            console.log(
+                `MACD: ${indicators.macd.macd?.toFixed(2)} | ` +
+                `Signal: ${indicators.macd.signal?.toFixed(2)} | ` +
+                `Hist: ${indicators.macd.histogram?.toFixed(2)}`
+            )
+
+        }
+    }
 }
 
+//    INDICATORS
+function calculateIndicators(tf) {
 
+    const closes = store[tf].map(c => c.close)
 
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+    let settings
+    if (tf === '1m') settings = [12, 24, 9]
+    if (tf === '15m') settings = [6, 13, 5]
+    if (tf === '30m') settings = [5, 10, 5]
+
+    const [fast, slow, signal] = settings
+
+    // Need enough candles for MACD
+    if (closes.length < slow + signal) return
+
+    const rsiArr = RSI.calculate({
+        period: 14,
+        values: closes
+    })
+
+    const macdArr = MACD.calculate({
+        values: closes,
+        fastPeriod: fast,
+        slowPeriod: slow,
+        signalPeriod: signal,
+        SimpleMAOscillator: false,
+        SimpleMASignal: false
+    })
+
+    const lastMacd = macdArr.length ? macdArr[macdArr.length - 1] : null
+    const lastRsi = rsiArr.length ? rsiArr[rsiArr.length - 1] : null
+
+    if (!lastMacd) return
+
+    const lastIndex = store[tf].length - 1
+
+    store[tf][lastIndex].indicators = {
+        rsi: lastRsi,
+        macd: {
+            macd: lastMacd.MACD,
+            signal: lastMacd.signal,
+            histogram: lastMacd.histogram
+        }
+    }
+}
+
+async function saveLiveCandle(tf) {
+    const candle = store[tf].at(-1)
+
+    await BTCIndicator.create({
+        script: SYMBOL,
+        timeframe: tf,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        timestamp: new Date(candle.timestamp),
+        indicators: candle.indicators
+    })
+
+    console.log(`Stored ${tf} candle`)
+}
+
+//    BUILD 15m FROM 1m
+
+async function build15m() {
+    if (store['1m'].length < 15) return
+
+    const last15 = store['1m'].slice(-15)
+
+    const firstMinute = new Date(last15[0].timestamp).getUTCMinutes()
+
+    if (firstMinute % 15 !== 0) return
+    const candle = {
+        timestamp: last15[0].timestamp,
+        open: last15[0].open,
+        close: last15.at(-1).close,
+        high: Math.max(...last15.map(c => c.high)),
+        low: Math.min(...last15.map(c => c.low))
+    }
+
+    store['15m'].push(candle)
+    if (store['15m'].length > MAX_MEMORY) store['15m'].shift()
+
+    calculateIndicators('15m')
+    logCandle('15m', candle, candle.indicators)
+    await saveLiveCandle('15m')
+
+    await build30m()
+}
+
+//    BUILD 30m FROM 15m
+
+async function build30m() {
+    if (store['15m'].length < 2) return
+
+    const last2 = store['15m'].slice(-2)
+
+    const firstMinute = new Date(last2[0].timestamp).getUTCMinutes()
+
+    if (firstMinute % 30 !== 0) return
+
+    const candle = {
+        timestamp: last2[0].timestamp,
+        open: last2[0].open,
+        close: last2[1].close,
+        high: Math.max(...last2.map(c => c.high)),
+        low: Math.min(...last2.map(c => c.low))
+    }
+
+    store['30m'].push(candle)
+    if (store['30m'].length > MAX_MEMORY) store['30m'].shift()
+
+    calculateIndicators('30m')
+    logCandle('30m', candle, candle.indicators)
+    await saveLiveCandle('30m')
+}
+
+//    HANDLE 1m CLOSE
+
+async function handle1mClose(candle) {
+    store['1m'].push(candle)
+    if (store['1m'].length > MAX_MEMORY) store['1m'].shift()
+
+    calculateIndicators('1m')
+
+    logCandle('1m', candle, candle.indicators)
+    await saveLiveCandle('1m')
+
+    await build15m()
+}
+
+//    HISTORICAL SEED
+
+function getLastClosedTimestamp(resolution) {
+
+    const now = new Date()
+
+    now.setSeconds(0)
+    now.setMilliseconds(0)
+
+    if (resolution === '1m') {
+        now.setMinutes(now.getMinutes() - 1)
+    }
+
+    if (resolution === '15m') {
+        const minute = now.getMinutes() - (now.getMinutes() % 15)
+        now.setMinutes(minute - 15)
+    }
+
+    if (resolution === '30m') {
+        const minute = now.getMinutes() - (now.getMinutes() % 30)
+        now.setMinutes(minute - 30)
+    }
+
+    return Math.floor(now.getTime() / 1000)
+}
+
+async function fetchDeltaHistory(resolution, limit) {
+
+    const end = getLastClosedTimestamp(resolution)
+
+    const secondsPerCandle = {
+        '1m': 60,
+        '15m': 900,
+        '30m': 1800
+    }
+
+    const start = end - (limit * secondsPerCandle[resolution])
+
+    const url =
+        `https://api.india.delta.exchange/v2/history/candles` +
+        `?symbol=${SYMBOL}&resolution=${resolution}&start=${start}&end=${end}`
+
+    const res = await fetch(url)
+    const json = await res.json()
+    const arr = json.result || []
+
+    return arr.reverse().map(c => ({
+        timestamp: c.time * 1000,
+        open: Number(c.open),
+        high: Number(c.high),
+        low: Number(c.low),
+        close: Number(c.close)
+    }))
+}
+
+async function seedHistorical() {
+    console.log('Seeding historical...')
+
+    store['1m'] = await fetchDeltaHistory('1m', 150)
+    store['15m'] = await fetchDeltaHistory('15m', 100)
+    store['30m'] = await fetchDeltaHistory('30m', 100)
+
+    calculateIndicators('1m')
+    calculateIndicators('15m')
+    calculateIndicators('30m')
+
+    console.log('Historical seed complete\n')
+}
+
+//    WEBSOCKET
+
+function startWebSocket() {
+
+    const ws = new WebSocket('wss://socket.india.delta.exchange')
+
+    let currentFormingCandle = null
+
+    ws.on('open', () => {
+        console.log('WebSocket connected')
+
+        ws.send(JSON.stringify({
+            type: 'subscribe',
+            payload: {
+                channels: [
+                    { name: 'candlestick_1m', symbols: [SYMBOL] }
+                ]
+            }
+        }))
+    })
+
+    ws.on('message', async (raw) => {
+
+        let data
+
+        try {
+            data = JSON.parse(raw)
+        } catch (err) {
+            return
+        }
+
+        if (data.type !== 'candlestick_1m') return
+        if (!data.candle_start_time) return
+
+        function normalizeDeltaTimestamp(ts) {
+            if (!ts) return 0;
+
+            ts = Number(ts)
+
+            // microseconds
+            if (ts > 1e15) return Math.floor(ts / 1000);
+
+            // milliseconds
+            if (ts > 1e12) return ts;
+
+            // seconds
+            return ts * 1000;
+        }
+
+        const timestamp = normalizeDeltaTimestamp(data.candle_start_time)
+
+        const incomingCandle = {
+            timestamp,
+            open: Number(data.open),
+            high: Number(data.high),
+            low: Number(data.low),
+            close: Number(data.close)
+        }
+
+        // FIRST CANDLE (engine just started)
+        if (!currentFormingCandle) {
+            currentFormingCandle = incomingCandle
+            return
+        }
+
+        // SAME CANDLE → update forming candle
+        if (incomingCandle.timestamp === currentFormingCandle.timestamp) {
+            currentFormingCandle = incomingCandle
+            return
+        }
+
+        // NEW CANDLE STARTED
+        // → previous candle is now CLOSED
+        const closedCandle = currentFormingCandle
+
+        currentFormingCandle = incomingCandle
+
+        try {
+            await handle1mClose(closedCandle)
+        } catch (err) {
+            console.error('Error processing closed candle:', err.message)
+        }
+
+    })
+
+    ws.on('close', () => {
+        console.log('WebSocket closed. Reconnecting in 5s...')
+        setTimeout(startWebSocket, 5000)
+    })
+
+    ws.on('error', (err) => {
+        console.error('WebSocket error:', err.message)
+        ws.close()
+    })
+}
+
+//    START ENGINE
+
+async function start() {
+    await seedHistorical()
+    startWebSocket()
+}
+
+start()
+
+const app = express()
+app.listen(4000, () => console.log('Server running on 4000'))

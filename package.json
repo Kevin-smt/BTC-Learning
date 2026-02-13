@@ -1,5 +1,5 @@
 {
-  "name": "binance-ws-ccxt",
+  "name": "btc-engine",
   "version": "1.0.0",
   "description": "Minimal backend: CCXT (REST) + Binance WebSocket, indicators (EMA, RSI, MACD), console output",
   "type": "module",
@@ -9,9 +9,24 @@
   },
   "dependencies": {
     "ccxt": "^3.0.67",
-    "express": "^4.18.2",
+    "dotenv": "^17.2.4",
+    "express": "^4.22.1",
     "node-fetch": "^3.3.2",
+    "pg": "^8.18.0",
+    "pg-hstore": "^2.3.4",
+    "sequelize": "^6.37.7",
     "technicalindicators": "^3.1.0",
     "ws": "^8.19.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kevin-smt/BTC-Learning.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Kevin-smt/BTC-Learning/issues"
+  },
+  "homepage": "https://github.com/Kevin-smt/BTC-Learning#readme"
 }
